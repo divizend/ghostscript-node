@@ -3,7 +3,25 @@ import fs from 'fs-extra';
 import tempy, { FileOptions } from 'tempy';
 import util from 'util';
 
-const exec = util.promisify(childProcess.exec);
+// Run external tools without a shell. `execFile` passes each argument directly to the
+// process (execve-style) instead of building a command string for `/bin/sh` or cmd.exe,
+// so shell metacharacters in any interpolated value are treated as literal data and can
+// never be interpreted as commands. This closes the OS command injection class (CWE-78)
+// that `util.promisify(childProcess.exec)` exposed.
+const execFile = util.promisify(childProcess.execFile);
+
+// Guards a caller-supplied value that is interpolated into a tool argument. Even though
+// `execFile` already prevents command injection, validating numeric inputs rejects
+// malformed values early and keeps error messages clear.
+function assertSafeInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    throw new Error(`Invalid ${name}: expected an integer`);
+  }
+  const num = Number(value);
+  if (!Number.isInteger(num) || (typeof value === 'string' && value.trim() === '')) {
+    throw new Error(`Invalid ${name}: expected an integer`);
+  }
+}
 
 interface TempFilenameSetDefs {
   [setName: string]: {
@@ -74,11 +92,17 @@ export async function combinePDFs(pdfBuffers: Buffer[]): Promise<Buffer> {
     return await useTempFilesPDF(
       { inputs: { writeBuffers: pdfBuffers }, output: { numFiles: 1 } },
       async ({ inputs, output }) => {
-        await exec(
-          `gs -q -dNOPAUSE -sDEVICE=pdfwrite -sOUTPUTFILE=${output[0]} -dBATCH -dAutoRotatePages=/None ${inputs.join(
-            ' ',
-          )} -c "[ /Creator () /Producer () /DOCINFO pdfmark"`,
-        );
+        await execFile('gs', [
+          '-q',
+          '-dNOPAUSE',
+          '-sDEVICE=pdfwrite',
+          `-sOUTPUTFILE=${output[0]}`,
+          '-dBATCH',
+          '-dAutoRotatePages=/None',
+          ...inputs,
+          '-c',
+          '[ /Creator () /Producer () /DOCINFO pdfmark',
+        ]);
         return fs.readFile(output[0]);
       },
     );
@@ -90,10 +114,18 @@ export async function combinePDFs(pdfBuffers: Buffer[]): Promise<Buffer> {
 export async function countPDFPages(pdfBuffer: Buffer): Promise<number> {
   try {
     return await useTempFilesPDFIn<number>(pdfBuffer, async input => {
+      // Backslashes are doubled because the path is embedded in a PostScript string
+      // literal `(...)` below; this is PostScript-level escaping, not shell escaping.
       const escapedInput = input.replace(/\\/g, '\\\\');
-      let { stdout } = await exec(
-        `gs -q -dNOPAUSE -dBATCH -dNOSAFER -dNODISPLAY -c "(${escapedInput}) (r) file runpdfbegin pdfpagecount = quit"`,
-      );
+      let { stdout } = await execFile('gs', [
+        '-q',
+        '-dNOPAUSE',
+        '-dBATCH',
+        '-dNOSAFER',
+        '-dNODISPLAY',
+        '-c',
+        `(${escapedInput}) (r) file runpdfbegin pdfpagecount = quit`,
+      ]);
 
       /**
        * Necessary for when Ghostscript detects a damaged but repairable PDF file, because then it outputs
@@ -121,11 +153,23 @@ export async function countPDFPages(pdfBuffer: Buffer): Promise<number> {
 }
 
 export async function extractPDFPages(pdfBuffer: Buffer, firstPage: number, lastPage: number): Promise<Buffer> {
+  assertSafeInteger(firstPage, 'firstPage');
+  assertSafeInteger(lastPage, 'lastPage');
+
   try {
     return await useTempFilesPDFInOut(pdfBuffer, async (input, output) => {
-      await exec(
-        `gs -q -dNOPAUSE -sDEVICE=pdfwrite -dBATCH -dNOSAFER -dFirstPage=${firstPage} -dLastPage=${lastPage} -dAutoRotatePages=/None -sOutputFile=${output} ${input}`,
-      );
+      await execFile('gs', [
+        '-q',
+        '-dNOPAUSE',
+        '-sDEVICE=pdfwrite',
+        '-dBATCH',
+        '-dNOSAFER',
+        `-dFirstPage=${firstPage}`,
+        `-dLastPage=${lastPage}`,
+        '-dAutoRotatePages=/None',
+        `-sOutputFile=${output}`,
+        input!,
+      ]);
     });
   } catch (e: any) {
     throw new Error('Failed to extract PDF pages: ' + e.message);
@@ -137,7 +181,7 @@ export async function rotatePDF(pdfBuffer: Buffer, direction: '90' | '180' | '27
 
   try {
     return await useTempFilesPDFInOut(pdfBuffer, async (input, output) => {
-      await exec(`qpdf ${input} ${output} --rotate=${direction}`);
+      await execFile('qpdf', [input!, output!, `--rotate=${direction}`]);
     });
   } catch (e: any) {
     throw new Error('Failed to rotate PDF: ' + e.message);
@@ -158,11 +202,20 @@ export async function convertToPDFA(
     version: 1,
   },
 ): Promise<Buffer> {
+  assertSafeInteger(options.version, 'version');
+
   try {
     return await useTempFilesPDFInOut(pdfBuffer, async (input, output) => {
-      await exec(
-        `gs -dPDFA -dBATCH -dNOPAUSE -sColorConversionStrategy=UseDeviceIndependentColor -sDEVICE=pdfwrite -dPDFACompatibilityPolicy=${options.version} -sOutputFile=${output} ${input}`,
-      );
+      await execFile('gs', [
+        '-dPDFA',
+        '-dBATCH',
+        '-dNOPAUSE',
+        '-sColorConversionStrategy=UseDeviceIndependentColor',
+        '-sDEVICE=pdfwrite',
+        `-dPDFACompatibilityPolicy=${options.version}`,
+        `-sOutputFile=${output}`,
+        input!,
+      ]);
     });
   } catch (e: any) {
     throw new Error('Failed to convert PDF to PDF/A: ' + e.message);
@@ -181,6 +234,10 @@ export async function renderPDFPagesToPNG(
   lastPage?: number,
   resolution = 300,
 ): Promise<Buffer[]> {
+  if (firstPage !== undefined) assertSafeInteger(firstPage, 'firstPage');
+  if (lastPage !== undefined) assertSafeInteger(lastPage, 'lastPage');
+  assertSafeInteger(resolution, 'resolution');
+
   const numPages = await countPDFPages(pdfBuffer);
 
   if (firstPage === undefined) firstPage = 1;
@@ -201,9 +258,25 @@ export async function renderPDFPagesToPNG(
   try {
     return await useTempFilesPDFIn(pdfBuffer, async input => {
       const outDir = tempy.directory();
-      await exec(
-        `gs -q -dQUIET -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -dMaxBitmap=500000000 -dAlignToPixels=0 -dGridFitTT=2 -sDEVICE=png16m -dTextAlphaBits=4 -dGraphicsAlphaBits=4 -r${resolution} -sOutputFile=${outDir}/%d.png -dFirstPage=${firstPage} -dLastPage=${lastPage} ${input}`,
-      );
+      await execFile('gs', [
+        '-q',
+        '-dQUIET',
+        '-dSAFER',
+        '-dBATCH',
+        '-dNOPAUSE',
+        '-dNOPROMPT',
+        '-dMaxBitmap=500000000',
+        '-dAlignToPixels=0',
+        '-dGridFitTT=2',
+        '-sDEVICE=png16m',
+        '-dTextAlphaBits=4',
+        '-dGraphicsAlphaBits=4',
+        `-r${resolution}`,
+        `-sOutputFile=${outDir}/%d.png`,
+        `-dFirstPage=${firstPage}`,
+        `-dLastPage=${lastPage}`,
+        input,
+      ]);
 
       const outFiles = [];
       for (let i = 1; i <= lastPage! - firstPage! + 1; i++) {
@@ -238,9 +311,25 @@ export async function compressPDF(pdfBuffer: Buffer | string, encoding?: BufferE
       pdfBuffer = Buffer.from(pdfBuffer, encoding ?? 'base64');
     }
     const compressedPdf = await useTempFilesPDFInOut(pdfBuffer, async (input, output) => {
-      await exec(
-        `gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dEmbedAllFonts=true -dSubsetFonts=true -dColorImageDownsampleType=/Bicubic -dColorImageResolution=144 -dGrayImageDownsampleType=/Bicubic -dGrayImageResolution=144 -dMonoImageDownsampleType=/Bicubic -dMonoImageResolution=144 -sOutputFile=${output} ${input}`,
-      );
+      await execFile('gs', [
+        '-q',
+        '-dNOPAUSE',
+        '-dBATCH',
+        '-dSAFER',
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        '-dPDFSETTINGS=/screen',
+        '-dEmbedAllFonts=true',
+        '-dSubsetFonts=true',
+        '-dColorImageDownsampleType=/Bicubic',
+        '-dColorImageResolution=144',
+        '-dGrayImageDownsampleType=/Bicubic',
+        '-dGrayImageResolution=144',
+        '-dMonoImageDownsampleType=/Bicubic',
+        '-dMonoImageResolution=144',
+        `-sOutputFile=${output}`,
+        input!,
+      ]);
     });
     if (pdfBuffer.length < compressedPdf.length) {
       return pdfBuffer;
